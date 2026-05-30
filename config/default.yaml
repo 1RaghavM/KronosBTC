@@ -1,0 +1,39 @@
+seed: 42
+symbol: "BTC/USD"
+granularity: 300
+
+data:
+  source: "coinbase"
+  start: "2025-12-01"
+  end: "2026-05-30"
+  data_dir: "data/"
+  rate_limit_req_per_sec: 10
+
+polymarket:
+  enabled: true
+  mode: "historical"
+
+model:
+  checkpoint: "NeoQuasar/Kronos-small"
+  tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  device: "auto"
+  max_context: 512
+
+estimators:
+  sample_count: 1000
+  temperature: 1.0
+  top_p: 0.9
+  garch_lookback: 2016
+
+calibration:
+  method: "isotonic"
+
+eval:
+  train_frac: 0.60
+  val_frac: 0.20
+  purge_windows: 1
+  embargo_windows: 1
+  edge_threshold: 0.02
+  bootstrap_samples: 10000
+  moneyness_near_threshold: 0.001
+  moneyness_far_threshold: 0.01
