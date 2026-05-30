@@ -76,4 +76,4 @@ tmp/
 .python-version
 
 # Strikecast runtime data
-data/
+/data/
