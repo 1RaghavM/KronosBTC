@@ -4,6 +4,8 @@ DEFAULT_TEMPERATURE: float = 1.0
 DEFAULT_TOP_P: float = 0.9
 ROUND_TRIP_COST: float = 0.02
 DEFAULT_GARCH_LOOKBACK: int = 2016
+DEFAULT_ECE_BINS: int = 15
+CALIBRATION_ARTIFACT_VERSION: int = 1
 CANDLE_COLUMNS: list[str] = [
     "symbol",
     "granularity",

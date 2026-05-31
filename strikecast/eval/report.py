@@ -22,6 +22,10 @@ class RunReport:
     kill_criterion_passed: bool | None
     timestamp: str
     label_source: str = "coinbase"
+    reliability_diagram_path: str | None = None
+    ece_uncalibrated: float | None = None
+    ece_calibrated: float | None = None
+    calibration_method: str | None = None
 
 
 def get_git_commit() -> str:
@@ -54,6 +58,10 @@ def to_json(report: RunReport) -> str:
         "kill_criterion_passed": report.kill_criterion_passed,
         "timestamp": report.timestamp,
         "label_source": report.label_source,
+        "calibration_method": report.calibration_method,
+        "ece_uncalibrated": report.ece_uncalibrated,
+        "ece_calibrated": report.ece_calibrated,
+        "reliability_diagram_path": report.reliability_diagram_path,
         "scores": [asdict(s) for s in report.scores],
     }
     return json.dumps(data, indent=2)
@@ -79,6 +87,23 @@ def to_markdown(report: RunReport) -> str:
         lines.append(f"- **Model checkpoint:** `{report.model_checkpoint}`")
 
     lines.append("")
+
+    if report.ece_uncalibrated is not None or report.ece_calibrated is not None:
+        lines.append("## Calibration")
+        lines.append("")
+        if report.calibration_method:
+            lines.append(f"- **Method:** {report.calibration_method}")
+        if report.ece_uncalibrated is not None:
+            lines.append(f"- **ECE (uncalibrated):** {report.ece_uncalibrated:.4f}")
+        if report.ece_calibrated is not None:
+            lines.append(f"- **ECE (calibrated):** {report.ece_calibrated:.4f}")
+        if report.reliability_diagram_path:
+            lines.append(
+                f"- **Reliability diagram:** `{report.reliability_diagram_path}`"
+            )
+            lines.append("")
+            lines.append(f"![Reliability diagram]({report.reliability_diagram_path})")
+        lines.append("")
 
     if report.kill_criterion_passed is False:
         lines.append("## **FAILED-KILL-CRITERION**")

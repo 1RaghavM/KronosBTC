@@ -56,6 +56,7 @@ class EvalConfig(BaseModel):
     moneyness_far_threshold: float = 0.01
     label_source: Literal["coinbase", "chainlink"] = "coinbase"
     max_test_windows: int | None = None
+    max_val_windows: int | None = None
 
     @model_validator(mode="after")
     def validate_split_fracs(self) -> EvalConfig:

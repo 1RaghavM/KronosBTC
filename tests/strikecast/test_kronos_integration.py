@@ -88,7 +88,49 @@ class TestRunKronosPhase:
         estimators = {s.estimator for s in report.scores}
         assert "randomwalk" in estimators
         assert "garch_mc" in estimators
-        assert "kronos" in estimators
+        assert "kronos_raw" in estimators
+        assert "kronos_cal" in estimators
+
+    def test_report_has_uncal_and_cal_ece(self, tmp_path: Path) -> None:
+        from strikecast.cli import run_kronos_phase
+        from strikecast.estimators.kronos_binary import KronosBinaryEstimator
+
+        _make_store_with_data(tmp_path)
+        kronos = KronosBinaryEstimator(_FakeSampler(), sample_count=500, seed=42)
+
+        report = run_kronos_phase(_config(tmp_path), kronos_estimator=kronos)
+
+        assert report.ece_uncalibrated is not None
+        assert report.ece_calibrated is not None
+        assert 0.0 <= report.ece_uncalibrated <= 1.0
+        assert 0.0 <= report.ece_calibrated <= 1.0
+        assert report.calibration_method == "isotonic"
+
+    def test_reliability_diagram_written(self, tmp_path: Path) -> None:
+        from strikecast.cli import run_kronos_phase
+        from strikecast.estimators.kronos_binary import KronosBinaryEstimator
+
+        _make_store_with_data(tmp_path)
+        kronos = KronosBinaryEstimator(_FakeSampler(), sample_count=500, seed=42)
+
+        report = run_kronos_phase(_config(tmp_path), kronos_estimator=kronos)
+
+        assert report.reliability_diagram_path is not None
+        assert Path(report.reliability_diagram_path).exists()
+        assert len(list((tmp_path / "reports").glob("*_calibrator.pkl"))) == 1
+
+    def test_kronos_cal_scores_have_valid_ece(self, tmp_path: Path) -> None:
+        from strikecast.cli import run_kronos_phase
+        from strikecast.estimators.kronos_binary import KronosBinaryEstimator
+
+        _make_store_with_data(tmp_path)
+        kronos = KronosBinaryEstimator(_FakeSampler(), sample_count=500, seed=42)
+
+        report = run_kronos_phase(_config(tmp_path), kronos_estimator=kronos)
+        cal_scores = [s for s in report.scores if s.estimator == "kronos_cal"]
+        assert cal_scores
+        for s in cal_scores:
+            assert 0.0 <= s.ece <= 1.0
 
     def test_report_records_model_checkpoint(self, tmp_path: Path) -> None:
         from strikecast.cli import run_kronos_phase
@@ -160,7 +202,9 @@ class TestRunKronosPhase:
 
         assert report.label_source == "coinbase"
         assert len(report.scores) > 0
-        assert {"randomwalk", "garch_mc", "kronos"} <= {s.estimator for s in report.scores}
+        assert {"randomwalk", "garch_mc", "kronos_raw", "kronos_cal"} <= {
+            s.estimator for s in report.scores
+        }
 
     def test_max_test_windows_cap(self, tmp_path: Path) -> None:
         from strikecast.cli import run_kronos_phase

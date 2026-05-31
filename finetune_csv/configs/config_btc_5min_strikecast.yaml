@@ -1,0 +1,86 @@
+# Strikecast BTC/USD 5-minute fine-tune config (FR-050, FR-051, FR-052).
+#
+# Starts from Kronos-small (predictor) + Kronos-Tokenizer-base, fine-tuned on
+# Coinbase BTC/USD 5-minute candles for the Strikecast binary-outcome engine.
+# Every path and hyperparameter the fine-tune needs lives in THIS file (FR-050).
+#
+# ONE-COMMAND FLOW:
+#   python train_sequential.py --config configs/config_btc_5min_strikecast.yaml
+# (tokenizer then predictor; add --skip-existing to resume, see FR-052 below.)
+
+data:
+  # FR-051 (LEAKAGE GUARD): this CSV MUST contain ONLY candles strictly BEFORE
+  # the evaluation test window. Produce it from the SAME walk-forward split used
+  # by strikecast.eval.splits.walk_forward_split (train_frac=0.60, val_frac=0.20,
+  # purge_windows=1, embargo_windows=1): export every candle whose
+  # window_open_ts is in split.train + split.val and drop everything from
+  # split.test onward (plus the purge+embargo gap). No test-window candle is
+  # ever seen during fine-tuning.
+  data_path: "/ABS/PATH/Kronos/finetune_csv/data/BTC_USD_5min_trainval.csv"
+  lookback_window: 512        # Kronos-small/base context limit (matches max_context)
+  predict_window: 1           # Strikecast forecasts the single next 5-min window
+  max_context: 512
+  clip: 5.0                   # z-score clip, matches KronosPredictor default
+  # Within the leakage-safe train+val CSV, hold out the tail as the fine-tune
+  # validation split (model-selection only; the calibrator's val split is the
+  # separate, disjoint eval val window handled by the CLI, not here).
+  train_ratio: 0.85
+  val_ratio: 0.15
+  test_ratio: 0.0             # the eval test window is excluded UPSTREAM (FR-051)
+
+training:
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  batch_size: 32              # fits Kronos-small in <= 16 GB (NFR-008)
+  log_interval: 50
+  num_workers: 6
+  seed: 42                    # matches config/default.yaml seed (NFR-003)
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.00001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+  # FR-052 / NFR-008: raise accumulation_steps (e.g. 4) to keep peak GPU memory
+  # within budget at the same effective batch size if 32 OOMs.
+  accumulation_steps: 1
+
+model_paths:
+  # Start from Kronos-small + its Tokenizer-base (FR-050). Point these at local
+  # copies of the pinned HuggingFace checkpoints (NeoQuasar/Kronos-small,
+  # NeoQuasar/Kronos-Tokenizer-base).
+  pretrained_tokenizer: "/ABS/PATH/Kronos/pretrained/Kronos-Tokenizer-base"
+  pretrained_predictor: "/ABS/PATH/Kronos/pretrained/Kronos-small"
+
+  exp_name: "strikecast_btc_5min"
+  base_path: "/ABS/PATH/Kronos/finetune_csv/finetuned/"
+
+  # Auto-generated from exp_name; leave empty.
+  base_save_path: ""          # -> {base_path}/{exp_name}
+  finetuned_tokenizer: ""     # -> {base_path}/{exp_name}/tokenizer/best_model
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "strikecast_btc_5min_finetune"
+  description: "Kronos-small fine-tune on Coinbase BTC/USD 5-min for Strikecast"
+
+  # FR-052: local loss logging only; Comet stays OFF. Per-epoch train/val loss
+  # is written to {base_save_path}/logs/ by the pipeline's setup_logging().
+  use_comet: false
+
+  train_tokenizer: true
+  train_basemodel: true
+
+  # FR-052 (RESUME): with skip_existing=true (or `--skip-existing`), a completed
+  # tokenizer/basemodel phase whose best_model already exists is skipped, so an
+  # interrupted run resumes from the last finished checkpoint instead of
+  # retraining from scratch.
+  skip_existing: false
+
+device:
+  use_cuda: true
+  device_id: 0

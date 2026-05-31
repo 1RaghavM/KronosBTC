@@ -4,12 +4,16 @@ import argparse
 import logging
 import random
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
 
+from strikecast.calibration.calibrator import fit_calibrator
+from strikecast.calibration.reliability import make_reliability_diagram
 from strikecast.config import StrikecastConfig, load_config
 from strikecast.data.candle_source import CoinbaseSource
 from strikecast.data.labels import build_coinbase_labels
@@ -24,6 +28,8 @@ from strikecast.eval.scoring import score_predictions
 from strikecast.eval.splits import walk_forward_split
 
 logger = logging.getLogger(__name__)
+
+_PredRow = dict[str, object]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Cap number of test windows evaluated (for quick laptop backtests)",
+    )
+    run_parser.add_argument(
+        "--max-val-windows",
+        type=int,
+        default=None,
+        help="Cap number of validation windows used to fit the calibrator",
     )
     run_parser.add_argument(
         "--label-source",
@@ -156,10 +168,232 @@ def run_data_phase(config: StrikecastConfig) -> None:
             logger.exception("Polymarket ingestion failed (non-fatal for Phase 0)")
 
 
+def _predict_over_windows(
+    candles: pd.DataFrame,
+    lookback_pool: pd.DataFrame,
+    lookback_ts: np.ndarray,
+    target_timestamps: list[int],
+    estimators: list[tuple[str, Estimator]],
+    garch_lookback: int,
+    min_lookback: int = 50,
+) -> list[_PredRow]:
+    """Generate one prediction row per (window, estimator) using a trailing lookback.
+
+    The lookback for a target window is the trailing ``garch_lookback`` candles
+    **strictly before** that window, drawn from the full contiguous candle
+    series (``lookback_pool``). Only past bars are reachable and the target
+    window's own close (the label) is never included, so this is leakage-safe
+    (NFR-002). Using the full series — rather than the train split — is critical:
+    test/val windows fall after the train range, so a train-only pool would feed
+    every estimator a stale, wrong-priced context and collapse every probability
+    to 0/1. Used for both the test windows and the disjoint validation windows
+    that fit the calibrator (FR-020).
+
+    Args:
+        candles: Full candle frame (for reading each target window's open).
+        lookback_pool: Full candle series (deduped, sorted by time) used as the
+            lookback pool for every target window.
+        lookback_ts: ``window_open_ts`` array of ``lookback_pool`` (sorted).
+        target_timestamps: Windows to predict (Unix epoch seconds).
+        estimators: ``(name, estimator)`` pairs to run on every window.
+        garch_lookback: Max number of trailing candles in the lookback.
+        min_lookback: Skip windows whose lookback has fewer than this many rows.
+
+    Returns:
+        List of prediction dicts (one per window/estimator), each holding the
+        raw and (estimator-)calibrated probability plus the bootstrap CI.
+    """
+    predictions: list[_PredRow] = []
+    for i, target_ts in enumerate(target_timestamps):
+        window = candles[candles["window_open_ts"] == target_ts]
+        if window.empty:
+            continue
+
+        strike = float(window.iloc[0]["open"])
+
+        # side="left" => index of target_ts itself, so the slice ends strictly
+        # before it (the target window's close is excluded -> no leakage).
+        idx = int(np.searchsorted(lookback_ts, target_ts, side="left"))
+        start_idx = max(0, idx - garch_lookback)
+        lookback = lookback_pool.iloc[start_idx:idx]
+
+        if len(lookback) < min_lookback:
+            continue
+
+        for name, est in estimators:
+            try:
+                result = est.estimate(lookback, strike)
+                predictions.append(
+                    {
+                        "window_open_ts": target_ts,
+                        "estimator": name,
+                        "strike": strike,
+                        "p": result.p,
+                        "p_raw": result.p_raw,
+                        "p_ci_low": result.ci_low,
+                        "p_ci_high": result.ci_high,
+                        "n_samples": result.n_samples,
+                        "moneyness": 0.0,
+                    }
+                )
+            except Exception:
+                logger.exception("Estimator %s failed for ts=%d", name, target_ts)
+
+        if (i + 1) % 50 == 0:
+            logger.info("Evaluated %d / %d windows", i + 1, len(target_timestamps))
+
+    return predictions
+
+
+@dataclass
+class _KronosCalibrationOutput:
+    """Bundle returned by :func:`_calibrate_and_score_kronos`."""
+
+    prediction_rows: list[_PredRow]
+    reliability_path: str | None
+    ece_uncalibrated: float | None
+    ece_calibrated: float | None
+    calibration_method: str | None
+
+
+def _calibrate_and_score_kronos(
+    *,
+    config: StrikecastConfig,
+    kronos_estimator: Estimator,
+    candles: pd.DataFrame,
+    labels: pd.DataFrame,
+    lookback_pool: pd.DataFrame,
+    lookback_ts: np.ndarray,
+    val_timestamps: list[int],
+    test_timestamps: list[int],
+    model_checkpoint: str | None,
+    reports_dir: Path,
+    run_id: str,
+) -> _KronosCalibrationOutput:
+    """Fit the calibrator on the val split and score raw + calibrated Kronos.
+
+    The calibrator is fit ONLY on the validation split (disjoint from train and
+    test, FR-020) using Kronos raw probabilities and their outcomes. It is then
+    applied to the test-split raw probabilities (FR-021). A CORP reliability
+    diagram and uncalibrated/calibrated ECE are written for audit (FR-022), and
+    the fitted map is persisted as a versioned artifact (FR-023).
+
+    Args:
+        config: Loaded Strikecast config.
+        kronos_estimator: Raw (uncalibrated) Kronos estimator.
+        candles: Full candle frame.
+        labels: Outcome labels keyed by ``window_open_ts``.
+        lookback_pool: Full contiguous candle series used for trailing lookbacks.
+        lookback_ts: ``window_open_ts`` array of ``lookback_pool``.
+        val_timestamps: Validation window timestamps (calibration set).
+        test_timestamps: Test window timestamps (scored set).
+        model_checkpoint: Checkpoint id stored on the calibrator artifact.
+        reports_dir: Directory for the reliability PNG and calibrator artifact.
+        run_id: Run identifier used to name artifacts.
+
+    Returns:
+        A :class:`_KronosCalibrationOutput` with ``kronos_raw`` + ``kronos_cal``
+        prediction rows and calibration diagnostics.
+    """
+    data_window = (config.data.start, config.data.end)
+    method = config.calibration.method
+
+    val_rows = _predict_over_windows(
+        candles,
+        lookback_pool,
+        lookback_ts,
+        val_timestamps,
+        [("kronos_val", kronos_estimator)],
+        config.estimators.garch_lookback,
+    )
+    test_rows = _predict_over_windows(
+        candles,
+        lookback_pool,
+        lookback_ts,
+        test_timestamps,
+        [("kronos_raw", kronos_estimator)],
+        config.estimators.garch_lookback,
+    )
+
+    label_outcomes = labels.set_index("window_open_ts")["outcome_up"].astype(float)
+
+    val_df = pd.DataFrame(val_rows)
+    if val_df.empty:
+        logger.warning(
+            "No Kronos validation predictions; skipping calibration (kronos_cal == kronos_raw)"
+        )
+        fallback_cal_rows = [dict(r, estimator="kronos_cal") for r in test_rows]
+        return _KronosCalibrationOutput(
+            prediction_rows=test_rows + fallback_cal_rows,
+            reliability_path=None,
+            ece_uncalibrated=None,
+            ece_calibrated=None,
+            calibration_method=None,
+        )
+
+    val_df = val_df.join(label_outcomes, on="window_open_ts").dropna(subset=["outcome_up"])
+    val_p_raw = val_df["p_raw"].to_numpy(dtype=float)
+    val_y = val_df["outcome_up"].to_numpy(dtype=float)
+
+    calibrator = fit_calibrator(
+        method,
+        val_p_raw,
+        val_y,
+        model_checkpoint=model_checkpoint,
+        data_window=data_window,
+    )
+    logger.info(
+        "Fit %s calibrator on %d disjoint validation windows", method, len(val_p_raw)
+    )
+
+    artifact_path = reports_dir / f"{run_id}_calibrator.pkl"
+    calibrator.save(artifact_path)
+
+    cal_rows: list[_PredRow] = []
+    for row in test_rows:
+        p_raw_val = cast(float, row["p_raw"])
+        p_cal = float(np.asarray(calibrator.apply(p_raw_val)).reshape(-1)[0])
+        cal_row = dict(row)
+        cal_row["estimator"] = "kronos_cal"
+        cal_row["p"] = p_cal
+        cal_rows.append(cal_row)
+
+    reliability_path: str | None = None
+    ece_uncalibrated: float | None = None
+    ece_calibrated: float | None = None
+
+    test_df = pd.DataFrame(test_rows).join(label_outcomes, on="window_open_ts")
+    test_df = test_df.dropna(subset=["outcome_up"])
+    if not test_df.empty:
+        p_raw_arr = test_df["p_raw"].to_numpy(dtype=float)
+        y_arr = test_df["outcome_up"].to_numpy(dtype=float)
+        p_cal_arr = np.asarray(calibrator.apply(p_raw_arr), dtype=float)
+        png_path = reports_dir / f"{run_id}_reliability.png"
+        rel = make_reliability_diagram(p_raw_arr, p_cal_arr, y_arr, png_path)
+        reliability_path = str(rel.png_path)
+        ece_uncalibrated = rel.ece_raw
+        ece_calibrated = rel.ece_cal
+        logger.info(
+            "Kronos ECE: raw=%.4f, calibrated=%.4f (reliability diagram: %s)",
+            ece_uncalibrated,
+            ece_calibrated,
+            reliability_path,
+        )
+
+    return _KronosCalibrationOutput(
+        prediction_rows=test_rows + cal_rows,
+        reliability_path=reliability_path,
+        ece_uncalibrated=ece_uncalibrated,
+        ece_calibrated=ece_calibrated,
+        calibration_method=method,
+    )
+
+
 def _evaluate_estimators(
     config: StrikecastConfig,
     estimators: list[tuple[str, Estimator]],
     *,
+    kronos_estimator: Estimator | None = None,
     model_checkpoint: str | None = None,
     kill_criterion_passed: bool | None = None,
 ) -> RunReport:
@@ -169,10 +403,18 @@ def _evaluate_estimators(
     test window using a trailing lookback, scores all estimators on the
     identical test windows/labels, then writes JSON + Markdown reports.
 
+    When ``kronos_estimator`` is provided (Phase 3), a calibrator is fit on the
+    **disjoint validation split** (FR-020) from the Kronos raw probabilities and
+    their outcomes, then both ``kronos_raw`` and ``kronos_cal`` are scored on the
+    test set next to the baselines (FR-021), and a CORP reliability diagram plus
+    uncalibrated/calibrated ECE are attached to the report (FR-022).
+
     Args:
         config: Loaded Strikecast config.
         estimators: ``(name, estimator)`` pairs scored side by side. The first
             entry is used as the Brier-skill-score reference baseline.
+        kronos_estimator: Optional zero-shot/fine-tuned Kronos estimator. When
+            set, its raw probabilities are calibrated on the val split.
         model_checkpoint: Recorded in the report (e.g. the Kronos HF id).
         kill_criterion_passed: Optional kill-criterion flag for the report.
 
@@ -216,13 +458,18 @@ def _evaluate_estimators(
         len(splits.test),
     )
 
-    train_set = set(splits.train)
-    train_candles = candles[candles["window_open_ts"].isin(train_set)].sort_values(
-        "window_open_ts"
+    # Lookback pool = the full contiguous candle series (strictly-past slices are
+    # taken per window inside _predict_over_windows). The train/val/test split
+    # only decides which windows are scored / used to fit the calibrator; it must
+    # NOT restrict the lookback context, or test windows get a stale train-tail
+    # context and every probability collapses to 0/1.
+    lookback_pool = (
+        candles.drop_duplicates("window_open_ts")
+        .sort_values("window_open_ts")
+        .reset_index(drop=True)
     )
-    train_ts = train_candles["window_open_ts"].values
+    lookback_ts = lookback_pool["window_open_ts"].to_numpy()
 
-    predictions: list[dict] = []
     test_timestamps = sorted(splits.test)
     if config.eval.max_test_windows is not None:
         test_timestamps = test_timestamps[: config.eval.max_test_windows]
@@ -231,44 +478,61 @@ def _evaluate_estimators(
             len(test_timestamps),
         )
 
-    for i, target_ts in enumerate(test_timestamps):
-        window = candles[candles["window_open_ts"] == target_ts]
-        if window.empty:
-            continue
+    val_timestamps = sorted(splits.val)
+    if config.eval.max_val_windows is not None:
+        # Keep the most recent val windows (closest to the test period) for calibration.
+        val_timestamps = val_timestamps[-config.eval.max_val_windows :]
+        logger.info(
+            "Capping calibration to last %d validation windows (max_val_windows)",
+            len(val_timestamps),
+        )
 
-        strike = float(window.iloc[0]["open"])
+    predictions = _predict_over_windows(
+        candles,
+        lookback_pool,
+        lookback_ts,
+        test_timestamps,
+        estimators,
+        config.estimators.garch_lookback,
+    )
+    logger.info(
+        "Generated %d baseline predictions across %d estimators",
+        len(predictions),
+        len(estimators),
+    )
 
-        idx = int(np.searchsorted(train_ts, target_ts, side="left"))
-        start_idx = max(0, idx - config.estimators.garch_lookback)
-        lookback = train_candles.iloc[start_idx:idx]
+    reports_dir = data_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    git_commit = get_git_commit()
+    run_id = make_run_id(git_commit)
 
-        if len(lookback) < 50:
-            continue
+    reliability_path: str | None = None
+    ece_uncalibrated: float | None = None
+    ece_calibrated: float | None = None
+    calibration_method: str | None = None
 
-        for name, est in estimators:
-            try:
-                result = est.estimate(lookback, strike)
-                predictions.append(
-                    {
-                        "window_open_ts": target_ts,
-                        "estimator": name,
-                        "strike": strike,
-                        "p": result.p,
-                        "p_raw": result.p_raw,
-                        "p_ci_low": result.ci_low,
-                        "p_ci_high": result.ci_high,
-                        "n_samples": result.n_samples,
-                        "moneyness": 0.0,
-                    }
-                )
-            except Exception:
-                logger.exception("Estimator %s failed for ts=%d", name, target_ts)
-
-        if (i + 1) % 50 == 0:
-            logger.info("Evaluated %d / %d test windows", i + 1, len(test_timestamps))
+    if kronos_estimator is not None:
+        kronos_rows = _calibrate_and_score_kronos(
+            config=config,
+            kronos_estimator=kronos_estimator,
+            candles=candles,
+            labels=labels,
+            lookback_pool=lookback_pool,
+            lookback_ts=lookback_ts,
+            val_timestamps=val_timestamps,
+            test_timestamps=test_timestamps,
+            model_checkpoint=model_checkpoint,
+            reports_dir=reports_dir,
+            run_id=run_id,
+        )
+        predictions.extend(kronos_rows.prediction_rows)
+        reliability_path = kronos_rows.reliability_path
+        ece_uncalibrated = kronos_rows.ece_uncalibrated
+        ece_calibrated = kronos_rows.ece_calibrated
+        calibration_method = kronos_rows.calibration_method
 
     pred_df = pd.DataFrame(predictions)
-    logger.info("Generated %d predictions across %d estimators", len(pred_df), len(estimators))
+    logger.info("Total predictions: %d rows", len(pred_df))
 
     reference = estimators[0][0]
     scores = score_predictions(
@@ -281,9 +545,6 @@ def _evaluate_estimators(
         seed=config.seed,
     )
 
-    git_commit = get_git_commit()
-    run_id = make_run_id(git_commit)
-
     report = RunReport(
         run_id=run_id,
         data_window=(config.data.start, config.data.end),
@@ -294,9 +555,12 @@ def _evaluate_estimators(
         kill_criterion_passed=kill_criterion_passed,
         timestamp=datetime.now(timezone.utc).isoformat(),
         label_source=config.eval.label_source,
+        reliability_diagram_path=reliability_path,
+        ece_uncalibrated=ece_uncalibrated,
+        ece_calibrated=ece_calibrated,
+        calibration_method=calibration_method,
     )
 
-    reports_dir = data_dir / "reports"
     write_report(report, reports_dir)
     logger.info("Report written to %s", reports_dir)
 
@@ -364,8 +628,9 @@ def run_kronos_phase(
             from the config is loaded.
 
     Returns:
-        The persisted :class:`RunReport` covering randomwalk, garch_mc, and
-        kronos on the identical test set.
+        The persisted :class:`RunReport` covering randomwalk, garch_mc,
+        kronos_raw, and kronos_cal on the identical test set, with the
+        calibrator fit on the disjoint validation split.
     """
     if kronos_estimator is None:
         kronos_estimator = _build_kronos_estimator(config)
@@ -379,11 +644,11 @@ def run_kronos_phase(
                 seed=config.seed,
             ),
         ),
-        ("kronos", kronos_estimator),
     ]
     return _evaluate_estimators(
         config,
         estimators,
+        kronos_estimator=kronos_estimator,
         model_checkpoint=config.model.checkpoint,
     )
 
@@ -407,6 +672,8 @@ def main() -> None:
         config.estimators.sample_count = args.sample_count
     if args.max_test_windows is not None:
         config.eval.max_test_windows = args.max_test_windows
+    if args.max_val_windows is not None:
+        config.eval.max_val_windows = args.max_val_windows
     if args.label_source is not None:
         config.eval.label_source = args.label_source
 

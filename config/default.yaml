@@ -40,3 +40,4 @@ eval:
   moneyness_far_threshold: 0.01
   label_source: "coinbase"   # coinbase = self-contained backtest (close>open); chainlink = Polymarket paper-PnL
   max_test_windows: null     # cap evaluated test windows for quick laptop/MPS runs; null = all
+  max_val_windows: null      # cap validation windows used to fit the calibrator; null = all

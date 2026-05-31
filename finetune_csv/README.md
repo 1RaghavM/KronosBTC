@@ -47,6 +47,26 @@ data:
 ```
 There are some other settings here, please see `configs/config_ali09988_candle-5min.yaml` for more comments.
 
+### Strikecast BTC/USD 5-min fine-tune (one command)
+
+For the Strikecast project, use `configs/config_btc_5min_strikecast.yaml` (starts
+from Kronos-small + Kronos-Tokenizer-base, all paths/hyperparameters in that one
+file — FR-050). One-command flow:
+
+```bash
+python train_sequential.py --config configs/config_btc_5min_strikecast.yaml
+```
+
+- **Leakage guard (FR-051):** the input CSV must contain only candles strictly
+  before the evaluation test window. Export the candles whose `window_open_ts`
+  falls in `split.train + split.val` from
+  `strikecast.eval.splits.walk_forward_split` (same `train_frac`/`val_frac`/
+  `purge`/`embargo` as `config/default.yaml`) and drop the test window onward, so
+  no test-window candle is ever seen during fine-tuning.
+- **Resume + local logging (FR-052):** add `--skip-existing` to resume from the
+  last completed checkpoint; per-epoch train/val loss is written locally to
+  `{base_save_path}/logs/` and Comet stays off (`use_comet: false`).
+
 ## 3. Training
 
 ### Method 1: Sequential Training (Recommended)
