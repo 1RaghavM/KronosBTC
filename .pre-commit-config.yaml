@@ -1,0 +1,41 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        args: ["--line-length=100"]
+        files: ^strikecast/
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.8
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+        files: ^strikecast/
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        args: ["--strict", "--ignore-missing-imports"]
+        files: ^strikecast/
+        additional_dependencies:
+          - pydantic>=2.0.0
+          - pandas-stubs
+          - types-PyYAML
+
+  - repo: local
+    hooks:
+      - id: no-order-path
+        name: NFR-001 import guard
+        entry: pytest tests/strikecast/test_no_order_path.py -x -q
+        language: system
+        pass_filenames: false
+        files: ^strikecast/
+
+      - id: grid-alignment
+        name: FR-007 grid alignment
+        entry: pytest tests/strikecast/test_grid_alignment.py -x -q
+        language: system
+        pass_filenames: false
+        files: ^strikecast/data/store\.py
