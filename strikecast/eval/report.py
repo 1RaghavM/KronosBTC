@@ -21,6 +21,7 @@ class RunReport:
     scores: list[ScoreResult]
     kill_criterion_passed: bool | None
     timestamp: str
+    label_source: str = "coinbase"
 
 
 def get_git_commit() -> str:
@@ -52,6 +53,7 @@ def to_json(report: RunReport) -> str:
         "seed": report.seed,
         "kill_criterion_passed": report.kill_criterion_passed,
         "timestamp": report.timestamp,
+        "label_source": report.label_source,
         "scores": [asdict(s) for s in report.scores],
     }
     return json.dumps(data, indent=2)
@@ -65,6 +67,13 @@ def to_markdown(report: RunReport) -> str:
     lines.append(f"- **Git commit:** `{report.git_commit}`")
     lines.append(f"- **Seed:** {report.seed}")
     lines.append(f"- **Timestamp:** {report.timestamp}")
+    lines.append(f"- **Label source:** {report.label_source}")
+
+    if report.label_source == "coinbase":
+        lines.append(
+            "  - _Outcome = Coinbase close > window-open price (model-internal). "
+            "NOT the Chainlink oracle; do not read as Polymarket paper-PnL._"
+        )
 
     if report.model_checkpoint:
         lines.append(f"- **Model checkpoint:** `{report.model_checkpoint}`")

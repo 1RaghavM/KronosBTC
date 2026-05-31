@@ -35,6 +35,43 @@ def _make_score_results():
     ]
 
 
+class TestLabelSource:
+    def test_label_source_in_json_and_markdown(self) -> None:
+        from strikecast.eval.report import RunReport, to_json, to_markdown
+
+        report = RunReport(
+            run_id="ls_run",
+            data_window=("2025-12-01", "2026-05-30"),
+            model_checkpoint=None,
+            git_commit="abc123",
+            seed=42,
+            scores=_make_score_results(),
+            kill_criterion_passed=None,
+            timestamp="2026-05-30T12:00:00Z",
+            label_source="coinbase",
+        )
+
+        assert json.loads(to_json(report))["label_source"] == "coinbase"
+        md = to_markdown(report)
+        assert "Label source" in md
+        assert "coinbase" in md
+
+    def test_default_label_source_is_coinbase(self) -> None:
+        from strikecast.eval.report import RunReport
+
+        report = RunReport(
+            run_id="r",
+            data_window=("a", "b"),
+            model_checkpoint=None,
+            git_commit="c",
+            seed=1,
+            scores=[],
+            kill_criterion_passed=None,
+            timestamp="t",
+        )
+        assert report.label_source == "coinbase"
+
+
 class TestRunReport:
     def test_construction(self) -> None:
         from strikecast.eval.report import RunReport

@@ -5,26 +5,34 @@ import pytest
 
 from strikecast.constants import WINDOW_SECONDS
 
+WINDOW_OPEN_TS = 1768435200  # 2026-01-15 00:00:00 UTC, 300s grid
 
-SAMPLE_GAMMA_RESPONSE = [
-    {
-        "id": "event_1",
-        "slug": "will-btc-5min-up-or-down",
-        "markets": [
-            {
-                "id": "cond_abc",
-                "question": "Will BTC go up?",
-                "outcomes": ["Up", "Down"],
-                "outcomePrices": "[0.52, 0.48]",
-                "clobTokenIds": "[\"tok_up_1\", \"tok_down_1\"]",
-                "closed": True,
-                "startDate": "2026-01-15T00:00:00Z",
-                "endDate": "2026-01-15T00:05:00Z",
-            }
-        ],
-        "description": "Price to beat: $42000.00",
-    }
-]
+SAMPLE_SEARCH_RESPONSE = {
+    "events": [
+        {
+            "id": "event_1",
+            "slug": f"btc-updown-5m-{WINDOW_OPEN_TS}",
+            "title": "Bitcoin Up or Down - January 14, 7:00PM-7:05PM ET",
+            "markets": [
+                {
+                    "id": "cond_abc",
+                    "question": "Bitcoin Up or Down - January 14, 7:00PM-7:05PM ET",
+                    "outcomes": ["Up", "Down"],
+                    "outcomePrices": "[0.52, 0.48]",
+                    "clobTokenIds": '["tok_up_1", "tok_down_1"]',
+                    "closed": True,
+                    "eventStartTime": "2026-01-15T00:00:00Z",
+                    "endDate": "2026-01-15T00:05:00Z",
+                    "description": (
+                        "Resolves Up if Chainlink BTC/USD at end >= price at start."
+                    ),
+                }
+            ],
+            "description": "Resolves on Chainlink BTC/USD stream.",
+        }
+    ],
+    "pagination": {"hasMore": False, "totalResults": 1},
+}
 
 
 class TestFetchMarketMetadata:
@@ -32,34 +40,57 @@ class TestFetchMarketMetadata:
         from strikecast.data.polymarket_read import fetch_market_metadata
 
         mock_response = MagicMock()
-        mock_response.json.return_value = SAMPLE_GAMMA_RESPONSE
+        mock_response.json.return_value = SAMPLE_SEARCH_RESPONSE
         mock_response.raise_for_status = MagicMock()
 
         with patch("strikecast.data.polymarket_read.httpx.get", return_value=mock_response):
             result = fetch_market_metadata(
-                start_ts=1768435200,
-                end_ts=1768435200 + 300,
+                start_ts=WINDOW_OPEN_TS,
+                end_ts=WINDOW_OPEN_TS + WINDOW_SECONDS,
             )
 
-        assert result is not None
-        assert len(result) >= 1
+        assert len(result) == 1
         row = result.iloc[0]
-        assert "condition_id" in result.columns
-        assert "token_id_up" in result.columns
-        assert "price_to_beat" in result.columns
-        assert "price_up" in result.columns
+        assert row["window_open_ts"] == WINDOW_OPEN_TS
+        assert row["condition_id"] == "cond_abc"
+        assert row["token_id_up"] == "tok_up_1"
+        assert row["price_up"] == pytest.approx(0.52)
 
     def test_returns_empty_when_no_markets(self) -> None:
         from strikecast.data.polymarket_read import fetch_market_metadata
 
         mock_response = MagicMock()
-        mock_response.json.return_value = []
+        mock_response.json.return_value = {"events": [], "pagination": {"hasMore": False}}
         mock_response.raise_for_status = MagicMock()
 
         with patch("strikecast.data.polymarket_read.httpx.get", return_value=mock_response):
             result = fetch_market_metadata(
-                start_ts=1768435200,
-                end_ts=1768435200 + 300,
+                start_ts=WINDOW_OPEN_TS,
+                end_ts=WINDOW_OPEN_TS + WINDOW_SECONDS,
+            )
+
+        assert len(result) == 0
+
+    def test_skips_non_5m_slug(self) -> None:
+        from strikecast.data.polymarket_read import fetch_market_metadata
+
+        payload = {
+            "events": [
+                {
+                    "slug": "btc-updown-15m-1771868700",
+                    "markets": [{"id": "x", "outcomePrices": "[0.5,0.5]", "clobTokenIds": '["a","b"]', "endDate": "2026-02-23T18:00:00Z"}],
+                }
+            ],
+            "pagination": {"hasMore": False},
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = payload
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("strikecast.data.polymarket_read.httpx.get", return_value=mock_response):
+            result = fetch_market_metadata(
+                start_ts=WINDOW_OPEN_TS,
+                end_ts=WINDOW_OPEN_TS + WINDOW_SECONDS,
             )
 
         assert len(result) == 0

@@ -25,6 +25,7 @@ class ModelConfig(BaseModel):
     tokenizer: str = "NeoQuasar/Kronos-Tokenizer-base"
     device: str = "auto"
     max_context: int = 512
+    max_batch: int = 256
 
 
 class EstimatorsConfig(BaseModel):
@@ -53,6 +54,8 @@ class EvalConfig(BaseModel):
     bootstrap_samples: int = 10000
     moneyness_near_threshold: float = 0.001
     moneyness_far_threshold: float = 0.01
+    label_source: Literal["coinbase", "chainlink"] = "coinbase"
+    max_test_windows: int | None = None
 
     @model_validator(mode="after")
     def validate_split_fracs(self) -> EvalConfig:

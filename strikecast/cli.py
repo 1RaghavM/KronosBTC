@@ -12,9 +12,12 @@ import pandas as pd
 
 from strikecast.config import StrikecastConfig, load_config
 from strikecast.data.candle_source import CoinbaseSource
+from strikecast.data.labels import build_coinbase_labels
 from strikecast.data.paginator import fetch_all_candles
 from strikecast.data.store import DataStore
+from strikecast.estimators.base import Estimator
 from strikecast.estimators.garch_mc import GarchMonteCarloEstimator
+from strikecast.estimators.kronos_binary import KronosBinaryEstimator
 from strikecast.estimators.random_walk import RandomWalkEstimator
 from strikecast.eval.report import RunReport, get_git_commit, make_run_id, write_report
 from strikecast.eval.scoring import score_predictions
@@ -43,6 +46,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["all", "data", "baseline", "kronos", "finetune", "decision"],
         default="all",
         help="Which phase to run (default: all)",
+    )
+    run_parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=None,
+        help="Override Monte Carlo sample_count (lower for faster MPS/CPU runs)",
+    )
+    run_parser.add_argument(
+        "--max-test-windows",
+        type=int,
+        default=None,
+        help="Cap number of test windows evaluated (for quick laptop backtests)",
+    )
+    run_parser.add_argument(
+        "--label-source",
+        type=str,
+        choices=["coinbase", "chainlink"],
+        default=None,
+        help="Override label source (default from config; coinbase = self-contained)",
     )
 
     return parser
@@ -134,17 +156,50 @@ def run_data_phase(config: StrikecastConfig) -> None:
             logger.exception("Polymarket ingestion failed (non-fatal for Phase 0)")
 
 
-def run_baseline_phase(config: StrikecastConfig) -> RunReport:
-    """Run Phase 1: baseline estimators on test windows, score, and report."""
+def _evaluate_estimators(
+    config: StrikecastConfig,
+    estimators: list[tuple[str, Estimator]],
+    *,
+    model_checkpoint: str | None = None,
+    kill_criterion_passed: bool | None = None,
+) -> RunReport:
+    """Run the walk-forward evaluation for a set of estimators and report.
+
+    Splits the candle store, generates a probability per estimator for every
+    test window using a trailing lookback, scores all estimators on the
+    identical test windows/labels, then writes JSON + Markdown reports.
+
+    Args:
+        config: Loaded Strikecast config.
+        estimators: ``(name, estimator)`` pairs scored side by side. The first
+            entry is used as the Brier-skill-score reference baseline.
+        model_checkpoint: Recorded in the report (e.g. the Kronos HF id).
+        kill_criterion_passed: Optional kill-criterion flag for the report.
+
+    Returns:
+        The persisted :class:`RunReport`.
+    """
     data_dir = Path(config.data.data_dir)
     _ensure_data_dirs(data_dir)
     store = DataStore(data_dir)
 
     candles = store.read_candles()
-    labels = store.read_labels()
 
     if candles.empty:
         raise RuntimeError("No candles in store. Run Phase 0 (data) first.")
+
+    if config.eval.label_source == "coinbase":
+        labels = build_coinbase_labels(candles)
+        logger.info("Using Coinbase-close labels (model-internal, %d windows)", len(labels))
+    else:
+        labels = store.read_labels()
+        logger.info("Using Chainlink resolution labels (%d windows)", len(labels))
+
+    if labels.empty:
+        raise RuntimeError(
+            f"No labels available for label_source='{config.eval.label_source}'. "
+            "For Chainlink labels, run Phase 0 Polymarket ingestion first."
+        )
 
     timestamps = sorted(int(t) for t in candles["window_open_ts"].unique())
     splits = walk_forward_split(
@@ -167,23 +222,21 @@ def run_baseline_phase(config: StrikecastConfig) -> RunReport:
     )
     train_ts = train_candles["window_open_ts"].values
 
-    rw = RandomWalkEstimator()
-    garch = GarchMonteCarloEstimator(
-        n_samples=config.estimators.sample_count,
-        seed=config.seed,
-    )
-    estimators: list[tuple[str, object]] = [("randomwalk", rw), ("garch_mc", garch)]
-
     predictions: list[dict] = []
     test_timestamps = sorted(splits.test)
+    if config.eval.max_test_windows is not None:
+        test_timestamps = test_timestamps[: config.eval.max_test_windows]
+        logger.info(
+            "Capping evaluation to first %d test windows (max_test_windows)",
+            len(test_timestamps),
+        )
 
     for i, target_ts in enumerate(test_timestamps):
         window = candles[candles["window_open_ts"] == target_ts]
         if window.empty:
             continue
 
-        open_price = float(window.iloc[0]["open"])
-        strike = open_price
+        strike = float(window.iloc[0]["open"])
 
         idx = int(np.searchsorted(train_ts, target_ts, side="left"))
         start_idx = max(0, idx - config.estimators.garch_lookback)
@@ -217,10 +270,11 @@ def run_baseline_phase(config: StrikecastConfig) -> RunReport:
     pred_df = pd.DataFrame(predictions)
     logger.info("Generated %d predictions across %d estimators", len(pred_df), len(estimators))
 
+    reference = estimators[0][0]
     scores = score_predictions(
         pred_df,
         labels,
-        reference_estimator="randomwalk",
+        reference_estimator=reference,
         moneyness_near=config.eval.moneyness_near_threshold,
         moneyness_far=config.eval.moneyness_far_threshold,
         n_bootstrap=config.eval.bootstrap_samples,
@@ -233,12 +287,13 @@ def run_baseline_phase(config: StrikecastConfig) -> RunReport:
     report = RunReport(
         run_id=run_id,
         data_window=(config.data.start, config.data.end),
-        model_checkpoint=None,
+        model_checkpoint=model_checkpoint,
         git_commit=git_commit,
         seed=config.seed,
         scores=scores,
-        kill_criterion_passed=None,
+        kill_criterion_passed=kill_criterion_passed,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        label_source=config.eval.label_source,
     )
 
     reports_dir = data_dir / "reports"
@@ -259,6 +314,80 @@ def run_baseline_phase(config: StrikecastConfig) -> RunReport:
     return report
 
 
+def run_baseline_phase(config: StrikecastConfig) -> RunReport:
+    """Run Phase 1: baseline estimators on test windows, score, and report."""
+    estimators: list[tuple[str, Estimator]] = [
+        ("randomwalk", RandomWalkEstimator()),
+        (
+            "garch_mc",
+            GarchMonteCarloEstimator(
+                n_samples=config.estimators.sample_count,
+                seed=config.seed,
+            ),
+        ),
+    ]
+    return _evaluate_estimators(config, estimators)
+
+
+def _build_kronos_estimator(config: StrikecastConfig) -> KronosBinaryEstimator:
+    """Load Kronos weights and build the zero-shot binary estimator."""
+    from strikecast.estimators.kronos_adapter import build_kronos_path_sampler
+
+    sampler = build_kronos_path_sampler(
+        checkpoint=config.model.checkpoint,
+        tokenizer_name=config.model.tokenizer,
+        device=config.model.device,
+        max_context=config.model.max_context,
+        max_batch=config.model.max_batch,
+    )
+    return KronosBinaryEstimator(
+        sampler,
+        sample_count=config.estimators.sample_count,
+        temperature=config.estimators.temperature,
+        top_p=config.estimators.top_p,
+        seed=config.seed,
+        max_context=config.model.max_context,
+    )
+
+
+def run_kronos_phase(
+    config: StrikecastConfig,
+    *,
+    kronos_estimator: Estimator | None = None,
+) -> RunReport:
+    """Run Phase 2: Kronos zero-shot, scored next to the baselines.
+
+    Args:
+        config: Loaded Strikecast config.
+        kronos_estimator: Optional pre-built estimator (used in tests to avoid
+            loading model weights). When ``None``, the real Kronos checkpoint
+            from the config is loaded.
+
+    Returns:
+        The persisted :class:`RunReport` covering randomwalk, garch_mc, and
+        kronos on the identical test set.
+    """
+    if kronos_estimator is None:
+        kronos_estimator = _build_kronos_estimator(config)
+
+    estimators: list[tuple[str, Estimator]] = [
+        ("randomwalk", RandomWalkEstimator()),
+        (
+            "garch_mc",
+            GarchMonteCarloEstimator(
+                n_samples=config.estimators.sample_count,
+                seed=config.seed,
+            ),
+        ),
+        ("kronos", kronos_estimator),
+    ]
+    return _evaluate_estimators(
+        config,
+        estimators,
+        model_checkpoint=config.model.checkpoint,
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -273,6 +402,14 @@ def main() -> None:
         sys.exit(1)
 
     config = load_config(args.config)
+
+    if args.sample_count is not None:
+        config.estimators.sample_count = args.sample_count
+    if args.max_test_windows is not None:
+        config.eval.max_test_windows = args.max_test_windows
+    if args.label_source is not None:
+        config.eval.label_source = args.label_source
+
     _set_seed(config.seed)
     logger.info("Loaded config from %s (seed=%d)", args.config, config.seed)
 
@@ -287,7 +424,7 @@ def main() -> None:
         run_baseline_phase(config)
 
     if args.phase in ("all", "kronos"):
-        logger.info("Phase 2 (kronos): not yet implemented")
+        run_kronos_phase(config)
 
     if args.phase in ("all", "finetune"):
         logger.info("Phase 3 (finetune): not yet implemented")

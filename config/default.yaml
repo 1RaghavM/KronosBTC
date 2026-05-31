@@ -16,8 +16,9 @@ polymarket:
 model:
   checkpoint: "NeoQuasar/Kronos-small"
   tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
-  device: "auto"
+  device: "auto"          # auto -> CUDA, else MPS (Apple Silicon), else CPU
   max_context: 512
+  max_batch: 256          # parallel MC paths per predict_batch call; lower (e.g. 64) if MPS OOMs
 
 estimators:
   sample_count: 1000
@@ -37,3 +38,5 @@ eval:
   bootstrap_samples: 10000
   moneyness_near_threshold: 0.001
   moneyness_far_threshold: 0.01
+  label_source: "coinbase"   # coinbase = self-contained backtest (close>open); chainlink = Polymarket paper-PnL
+  max_test_windows: null     # cap evaluated test windows for quick laptop/MPS runs; null = all
