@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override label source (default from config; coinbase = self-contained)",
     )
+    run_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable DEBUG logging",
+    )
 
     return parser
 
@@ -655,7 +661,7 @@ def run_kronos_phase(
 
 def main() -> None:
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
