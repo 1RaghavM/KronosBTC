@@ -1,0 +1,10 @@
+# Core deps for model inference + Strikecast (no matplotlib).
+# Use when installing on Python 3.13+ or to avoid matplotlib build issues.
+numpy
+pandas==2.2.2
+torch>=2.0.0
+
+einops==0.8.1
+huggingface_hub==0.33.1
+tqdm==4.67.1
+safetensors==0.6.2

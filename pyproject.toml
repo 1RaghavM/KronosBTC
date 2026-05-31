@@ -1,0 +1,19 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "B", "UP", "SIM", "PD"]
+
+[tool.ruff.isort]
+known-first-party = ["strikecast"]
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+files = ["strikecast/"]
