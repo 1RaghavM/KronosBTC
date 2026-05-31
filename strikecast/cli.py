@@ -4,14 +4,21 @@ import argparse
 import logging
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from strikecast.config import StrikecastConfig, load_config
 from strikecast.data.candle_source import CoinbaseSource
 from strikecast.data.paginator import fetch_all_candles
 from strikecast.data.store import DataStore
+from strikecast.estimators.garch_mc import GarchMonteCarloEstimator
+from strikecast.estimators.random_walk import RandomWalkEstimator
+from strikecast.eval.report import RunReport, get_git_commit, make_run_id, write_report
+from strikecast.eval.scoring import score_predictions
+from strikecast.eval.splits import walk_forward_split
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +134,131 @@ def run_data_phase(config: StrikecastConfig) -> None:
             logger.exception("Polymarket ingestion failed (non-fatal for Phase 0)")
 
 
+def run_baseline_phase(config: StrikecastConfig) -> RunReport:
+    """Run Phase 1: baseline estimators on test windows, score, and report."""
+    data_dir = Path(config.data.data_dir)
+    _ensure_data_dirs(data_dir)
+    store = DataStore(data_dir)
+
+    candles = store.read_candles()
+    labels = store.read_labels()
+
+    if candles.empty:
+        raise RuntimeError("No candles in store. Run Phase 0 (data) first.")
+
+    timestamps = sorted(int(t) for t in candles["window_open_ts"].unique())
+    splits = walk_forward_split(
+        timestamps=timestamps,
+        train_frac=config.eval.train_frac,
+        val_frac=config.eval.val_frac,
+        purge_windows=config.eval.purge_windows,
+        embargo_windows=config.eval.embargo_windows,
+    )
+    logger.info(
+        "Split: train=%d, val=%d, test=%d windows",
+        len(splits.train),
+        len(splits.val),
+        len(splits.test),
+    )
+
+    train_set = set(splits.train)
+    train_candles = candles[candles["window_open_ts"].isin(train_set)].sort_values(
+        "window_open_ts"
+    )
+    train_ts = train_candles["window_open_ts"].values
+
+    rw = RandomWalkEstimator()
+    garch = GarchMonteCarloEstimator(
+        n_samples=config.estimators.sample_count,
+        seed=config.seed,
+    )
+    estimators: list[tuple[str, object]] = [("randomwalk", rw), ("garch_mc", garch)]
+
+    predictions: list[dict] = []
+    test_timestamps = sorted(splits.test)
+
+    for i, target_ts in enumerate(test_timestamps):
+        window = candles[candles["window_open_ts"] == target_ts]
+        if window.empty:
+            continue
+
+        open_price = float(window.iloc[0]["open"])
+        strike = open_price
+
+        idx = int(np.searchsorted(train_ts, target_ts, side="left"))
+        start_idx = max(0, idx - config.estimators.garch_lookback)
+        lookback = train_candles.iloc[start_idx:idx]
+
+        if len(lookback) < 50:
+            continue
+
+        for name, est in estimators:
+            try:
+                result = est.estimate(lookback, strike)
+                predictions.append(
+                    {
+                        "window_open_ts": target_ts,
+                        "estimator": name,
+                        "strike": strike,
+                        "p": result.p,
+                        "p_raw": result.p_raw,
+                        "p_ci_low": result.ci_low,
+                        "p_ci_high": result.ci_high,
+                        "n_samples": result.n_samples,
+                        "moneyness": 0.0,
+                    }
+                )
+            except Exception:
+                logger.exception("Estimator %s failed for ts=%d", name, target_ts)
+
+        if (i + 1) % 50 == 0:
+            logger.info("Evaluated %d / %d test windows", i + 1, len(test_timestamps))
+
+    pred_df = pd.DataFrame(predictions)
+    logger.info("Generated %d predictions across %d estimators", len(pred_df), len(estimators))
+
+    scores = score_predictions(
+        pred_df,
+        labels,
+        reference_estimator="randomwalk",
+        moneyness_near=config.eval.moneyness_near_threshold,
+        moneyness_far=config.eval.moneyness_far_threshold,
+        n_bootstrap=config.eval.bootstrap_samples,
+        seed=config.seed,
+    )
+
+    git_commit = get_git_commit()
+    run_id = make_run_id(git_commit)
+
+    report = RunReport(
+        run_id=run_id,
+        data_window=(config.data.start, config.data.end),
+        model_checkpoint=None,
+        git_commit=git_commit,
+        seed=config.seed,
+        scores=scores,
+        kill_criterion_passed=None,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+    reports_dir = data_dir / "reports"
+    write_report(report, reports_dir)
+    logger.info("Report written to %s", reports_dir)
+
+    for s in scores:
+        if s.moneyness_bucket == "all":
+            logger.info(
+                "  %s: Brier=%.4f [%.4f, %.4f], BSS=%s",
+                s.estimator,
+                s.brier,
+                s.ci_brier[0],
+                s.ci_brier[1],
+                f"{s.brier_skill_score:+.4f}" if s.brier_skill_score is not None else "n/a",
+            )
+
+    return report
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -152,7 +284,7 @@ def main() -> None:
         return
 
     if args.phase in ("all", "baseline"):
-        logger.info("Phase 1 (baseline): not yet implemented")
+        run_baseline_phase(config)
 
     if args.phase in ("all", "kronos"):
         logger.info("Phase 2 (kronos): not yet implemented")
