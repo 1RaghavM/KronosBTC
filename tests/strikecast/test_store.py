@@ -77,3 +77,139 @@ class TestCandleStore:
         store = DataStore(tmp_data_dir)
         result = store.read_candles()
         assert len(result) == 0
+
+
+class TestGapDetection:
+    def test_no_gaps_returns_empty(
+        self, tmp_data_dir: Path, sample_candles: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        store.append_candles(sample_candles)
+        gaps = store.detect_gaps()
+        assert len(gaps) == 0
+
+    def test_detects_single_gap(
+        self, tmp_data_dir: Path, sample_candles: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        gapped = sample_candles.drop(index=[5, 6, 7]).reset_index(drop=True)
+        store = DataStore(tmp_data_dir)
+        store.append_candles(gapped)
+        gaps = store.detect_gaps()
+
+        assert len(gaps) == 1
+        assert gaps.iloc[0]["missing_count"] == 3
+
+    def test_detects_multiple_gaps(
+        self, tmp_data_dir: Path, sample_candles: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        gapped = sample_candles.drop(index=[3, 10, 11]).reset_index(drop=True)
+        store = DataStore(tmp_data_dir)
+        store.append_candles(gapped)
+        gaps = store.detect_gaps()
+
+        assert len(gaps) == 2
+        assert gaps.iloc[0]["missing_count"] == 1
+        assert gaps.iloc[1]["missing_count"] == 2
+
+    def test_empty_store_returns_empty_gaps(self, tmp_data_dir: Path) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        gaps = store.detect_gaps()
+        assert len(gaps) == 0
+
+
+class TestMarketStore:
+    def test_append_and_read_round_trip(
+        self, tmp_data_dir: Path, sample_markets: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        store.append_markets(sample_markets)
+        result = store.read_markets()
+
+        assert len(result) == len(sample_markets)
+        pd.testing.assert_frame_equal(
+            result.sort_values("window_open_ts").reset_index(drop=True),
+            sample_markets.sort_values("window_open_ts").reset_index(drop=True),
+        )
+
+    def test_deduplicates_on_rewrite(
+        self, tmp_data_dir: Path, sample_markets: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        store.append_markets(sample_markets)
+        store.append_markets(sample_markets)
+        result = store.read_markets()
+        assert len(result) == len(sample_markets)
+
+
+class TestLabelStore:
+    def test_append_and_read_round_trip(
+        self, tmp_data_dir: Path, sample_labels: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        store.append_labels(sample_labels)
+        result = store.read_labels()
+
+        assert len(result) == len(sample_labels)
+        pd.testing.assert_frame_equal(
+            result.sort_values("window_open_ts").reset_index(drop=True),
+            sample_labels.sort_values("window_open_ts").reset_index(drop=True),
+        )
+
+    def test_rejects_off_grid_label(
+        self, tmp_data_dir: Path, sample_labels: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore, GridAlignmentError
+
+        bad = sample_labels.copy()
+        bad.loc[0, "window_open_ts"] = bad.loc[0, "window_open_ts"] + 7
+
+        store = DataStore(tmp_data_dir)
+        with pytest.raises(GridAlignmentError):
+            store.append_labels(bad)
+
+
+class TestDuckDBQuery:
+    def test_query_candles(
+        self, tmp_data_dir: Path, sample_candles: pd.DataFrame
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        store.append_candles(sample_candles)
+        result = store.query("SELECT count(*) AS n FROM candles")
+        assert result.iloc[0]["n"] == len(sample_candles)
+
+    def test_query_join_candles_and_labels(
+        self,
+        tmp_data_dir: Path,
+        sample_candles: pd.DataFrame,
+        sample_labels: pd.DataFrame,
+    ) -> None:
+        from strikecast.data.store import DataStore
+
+        store = DataStore(tmp_data_dir)
+        store.append_candles(sample_candles)
+        store.append_labels(sample_labels)
+
+        result = store.query(
+            """
+            SELECT c.window_open_ts, c.close, l.oracle_close
+            FROM candles c
+            JOIN resolution_labels l ON c.window_open_ts = l.window_open_ts
+            """
+        )
+        assert len(result) == len(sample_labels)
