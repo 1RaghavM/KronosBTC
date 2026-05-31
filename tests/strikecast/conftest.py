@@ -71,3 +71,45 @@ def sample_labels() -> pd.DataFrame:
             "outcome_up": [True, False, True, False, True],
         }
     )
+
+
+@pytest.fixture
+def large_candle_series() -> pd.DataFrame:
+    """500 consecutive 5-min BTC candles with geometric random-walk prices."""
+    base_ts = 1_700_000_000
+    base_ts = base_ts - (base_ts % WINDOW_SECONDS)
+    n = 500
+    rng = np.random.RandomState(42)
+
+    log_returns = rng.normal(0, 0.001, n)
+    log_prices = np.log(35000.0) + np.cumsum(log_returns)
+    prices = np.exp(log_prices)
+
+    return pd.DataFrame(
+        {
+            "symbol": "BTC/USD",
+            "granularity": WINDOW_SECONDS,
+            "window_open_ts": [base_ts + i * WINDOW_SECONDS for i in range(n)],
+            "open": prices,
+            "high": prices * (1 + rng.uniform(0.0001, 0.001, n)),
+            "low": prices * (1 - rng.uniform(0.0001, 0.001, n)),
+            "close": prices * (1 + rng.normal(0, 0.0005, n)),
+            "volume": rng.uniform(0.1, 10.0, n),
+            "amount": 0.0,
+            "source": "coinbase",
+        }
+    )
+
+
+@pytest.fixture
+def large_labels(large_candle_series: pd.DataFrame) -> pd.DataFrame:
+    """Resolution labels for the large candle series (close vs open)."""
+    df = large_candle_series
+    return pd.DataFrame(
+        {
+            "window_open_ts": df["window_open_ts"],
+            "oracle_close": df["close"],
+            "coinbase_close": df["close"],
+            "outcome_up": df["close"] > df["open"],
+        }
+    )

@@ -32,3 +32,16 @@ LABEL_COLUMNS: list[str] = [
     "coinbase_close",
     "outcome_up",
 ]
+PREDICTION_COLUMNS: list[str] = [
+    "run_id",
+    "window_open_ts",
+    "estimator",
+    "strike",
+    "p",
+    "p_raw",
+    "p_ci_low",
+    "p_ci_high",
+    "n_samples",
+    "label",
+    "moneyness",
+]

@@ -18,3 +18,8 @@ pytest-cov>=5.0.0
 black>=24.0.0
 ruff>=0.4.0
 mypy>=1.10.0
+
+# Phase 1: baselines + scoring
+arch>=7.0.0
+scipy>=1.11.0
+hypothesis>=6.0.0
